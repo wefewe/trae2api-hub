@@ -1,0 +1,44 @@
+name: Sync upstream source from shuishuipingan/trae2api-hub
+
+on:
+  schedule:
+    - cron: '37 */2 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Fetch latest upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/u && git clone --depth=1 https://github.com/shuishuipingan/trae2api-hub.git /tmp/u
+          rm -rf upstream && mkdir -p upstream
+          cp -a /tmp/u/. upstream/
+          rm -rf upstream/.git upstream/.github
+          cd /tmp/u && git rev-parse --short HEAD > "${GITHUB_WORKSPACE}/upstream/UPSTREAM-COMMIT.txt"
+
+      - name: Commit if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A -f
+            git commit -m "chore: sync upstream shuishuipingan/trae2api-hub"
+            git push
+            echo "✅ upstream updated and pushed"
+            gh workflow run build.yml --repo "$GITHUB_REPOSITORY"
+          else
+            echo "✅ upstream already up to date"
+          fi
