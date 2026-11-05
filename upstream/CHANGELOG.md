@@ -1,3 +1,53 @@
+## [1.4.3] - 2026-11-05
+
+### 问题修复
+- SOLO 通道 device_id / machine_id 缺省值改为按账号 UID 派生，避免多个部署共用同一硬编码设备导致 4017 风控。
+- 账号级 extra.device_id / machine_id 仍然优先。
+- 版本号升级到 **1.4.3**。
+
+## [1.4.2] - 2026-11-05
+
+### 🐛 问题修复
+
+- SOLO 通道（Agent 模型）遇到上游 `progress_notice` 的字符串 data 帧时抛
+  `AttributeError: 'str' object has no attribute 'get'`，请求 502（实测 kimi-k3 连续 8 次失败 4 次）。
+- 带 `tools` 的请求统一回 4001：上游 `FunctionDefinition.tools[].function.parameters` 要 string，
+  网关直接送 OpenAI 的 dict。
+
+### ✨ 新增功能
+
+- SOLO 通道支持工具调用：上游 `tool_calls` 增量帧按 index 聚合，回填标准 OpenAI
+  `tool_calls`（非流式）与 `delta.tool_calls`（流式），`finish_reason` 相应改为 `tool_calls`。
+- SOLO 通道支持多轮工具往返：保留 `assistant.tool_calls` 消息，并给 `tool` 回执补上
+  `tool_call_id` + `name`（name 由历史 `assistant.tool_calls` 的 id→name 映射）。
+  修复第二轮回灌时报 `4027 tool_call_id is not found ... tool name: ''`。
+- 工具调用严格校验：`arguments` 必须是**完整 JSON 对象**（截断/畸形直接报错，不自动修复）；
+  上游 `finish_reason` 不是 `stop`（如 `length` 截断）时不再包装成可执行的 `tool_calls`。
+
+### ✅ 测试
+
+- `_test_trae.py` 新增 [6] SOLO 通道分组：非对象 data 帧、tools.parameters 归一、
+  tool_calls 聚合、工具消息保留与各类缺字段报错，共 26 项断言。
+
+- 版本号升级到 **1.4.2**。
+
+## [1.4.1] - 2026-10-23
+
+### 问题修复
+- 账号测试不再使用非法 model=auto，CN/INTL 分别选择合法 raw 模型。
+- 账号池装载时清理已过期冷却，避免 no usable account。
+- 统计页补齐卡片、图表和热力图动效；日期区间可交互切换。
+- 版本号升级到 1.4.1。
+
+## [1.4.0] - 2026-10-23
+
+### 新增功能
+- 接入 Trae SOLO 纯 HTTP 通道：/api/agent/v3/llm_utils_chat。
+- /v1/chat/completions 自动识别 20 个 SOLO/Agent 模型。
+- 新增 /v1/agent/chat 显式入口，支持流式与非流式。
+- 新增统计概览：KPI、Top 账号/提供商、365 天热力图、缓存窗口和趋势图。
+- 版本号升级到 1.4.0。
+
 ## [1.1.5] - 2026-10-22
 
 ### ✨ 新增功能
