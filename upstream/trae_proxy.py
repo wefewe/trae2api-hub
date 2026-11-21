@@ -85,7 +85,7 @@ except Exception:                           # ImportError / 语法错误都回�
 
 TRAE_CLIENT_SOURCE = "trae_client" if _trae_client is not None else "embedded"
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 SOLO_MODEL_ALIASES = {
     "Seed-Code": "Doubao-Seed-Code",
@@ -111,6 +111,35 @@ SOLO_AGENT_MODELS = {
     "Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Turbo", "Doubao-Seed-Evolving",
     "step-5-preview",
 } | set(SOLO_MODEL_ALIASES)
+
+# 上游 llm_utils_chat 按 function 分组，两组的模型集合不通用：
+#   · solo_work_remote  18 个
+#   · solo_agent_remote 20 个（多出 Doubao-Seed-Code / qwen3.8-flash）
+# 把只在 agent 组的模型发给 solo_work_lite，上游不会回 "model not found"，
+# 而是回 4001 "the param is invalid"，很容易被误判成 max_tokens / messages 的问题。
+# 清单来源：
+#   GET /api/remote/v1/models?functions=solo_agent_remote,solo_work_remote,solo_design_remote
+# 实测（2026-11-20）：Seed-Code 在 solo_agent_lite / solo_agent_remote 都能跑，
+# qwen3.8-flash 只有 solo_agent_remote 能跑，所以统一用 remote。
+SOLO_AGENT_ONLY = {"Doubao-Seed-Code", "qwen3.8-flash"}
+
+
+def _solo_agent_only_key(model):
+    """Resolve only agent-only CN models, including their aliases and -solo form."""
+    name = str(model or "").strip().removesuffix("-solo")
+    if not name or "/" in name:
+        return None  # Do not claim another provider's namespace via catalog tail matching.
+    key = SOLO_MODEL_ALIASES.get(name, name)
+    if key not in SOLO_AGENT_ONLY:
+        key = trae_catalog.resolve_upstream_key(name, realm="cn")
+    return key if key in SOLO_AGENT_ONLY else None
+
+
+def solo_function_for(model):
+    """Select the SOLO function for a canonical upstream model key."""
+    return "solo_agent_remote" if model in SOLO_AGENT_ONLY else "solo_work_lite"
+
+
 CURRENT_REALM = os.environ.get("TRAE_PROXY_DEFAULT_REALM", "cn")
 
 
@@ -493,6 +522,28 @@ class UpstreamStatus(Exception):
         super(UpstreamStatus, self).__init__("upstream status %s" % status)
         self.status = status
         self.detail = str(detail or "")
+
+
+class TerminalProviderError(UpstreamStatus):
+    """Upstream business refusal: do not reopen the current request."""
+
+
+class ProviderQuota(TerminalProviderError):
+    provider_code = 4008
+
+    def __init__(self):
+        super().__init__(429, "Trae 4008: upstream quota exhausted; wait for quota to reset.")
+
+
+class ProviderRisk(TerminalProviderError):
+    """Terminal Trae refusal with its original business code, not an auth failure."""
+
+    def __init__(self, provider_code):
+        self.provider_code = provider_code
+        status, _ = TRAE_ERROR_MAP[provider_code]
+        super(ProviderRisk, self).__init__(
+            status, "Trae %d: upstream refused the request; the gateway stopped. "
+            "Do not retry immediately." % provider_code)
 
 
 # CORS is only needed by browser-based chat clients that call the OpenAI-style
@@ -6229,7 +6280,7 @@ def _solo_tool_calls(slots):
 
 
 def trae_solo_chat(account, payload, timeout=180):
-    """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite).
+    """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite / solo_agent_remote).
 
     This is the portable Trae SOLO channel used by Agent models. It only needs
     the account access token plus the device identity; no SQLCipher, no AHA,
@@ -6272,15 +6323,14 @@ def trae_solo_chat(account, payload, timeout=180):
         "Request-Traffic-Type": "prod",
     }
     model = str(payload.get("model") or "deepseek-v4.1-flash").strip()
-    model = SOLO_MODEL_ALIASES.get(model, model)
-    if model.endswith("-solo"):
-        model = model[:-5]
+    model = (_solo_agent_only_key(model)
+             or SOLO_MODEL_ALIASES.get(model, model).removesuffix("-solo"))
     messages = _solo_messages(payload)
     if not messages:
         raise RuntimeError("messages must not be empty")
     body = {
         "messages": messages,
-        "function": "solo_work_lite",
+        "function": solo_function_for(model),
         "stream": True,
         "config_name": model,
         "model": model,
@@ -6675,7 +6725,7 @@ TRAE_ERROR_MAP = {
     1001: (401, "auth"),             # 鉴权失败 -> 刷新 token / 换号
     4001: (400, "invalid_request"),  # 参数非法 -> 直接回客户端，不重试
     3003: (502, "prompt_pipeline"),
-    4015: (403, "risk_control"),     # 国际版账号/出口风控 -> 冷却换号
+    4015: (403, "risk_control"),     # 上游拒绝 -> 只冷却命中账号，终止当前请求
     4019: (403, "risk_control"),
     4008: (429, "quota_exceeded"),   # 免费额度用尽，不是 4015 风控
     4023: (400, "model_unknown"),    # 模型未知 -> 用 model_list 的 name
@@ -6685,8 +6735,7 @@ TRAE_ERROR_MAP = {
 def trae_error_status(code, message="", error=""):
     """Trae 错误码 -> (http_status, detail, kind)。
 
-    detail 里带 kind 与原始文案：上层（friendly_upstream_error /
-    _handle_envelope_account_cooldown）据此决定「换号 / 不重试 / 冷却」。
+    detail 里带 kind 与原始文案，供客户端错误消息和日志展示。
     """
     try:
         code_i = int(code)
@@ -6697,6 +6746,32 @@ def trae_error_status(code, message="", error=""):
     detail = "trae %s %s: %s" % (code_i or "?", kind,
                                  text[:300] or "(no upstream message)")
     return status, detail, kind
+
+
+def _provider_risk_code(code):
+    # The provider sends integer codes and their exact string equivalents.
+    if type(code) is int and code in (4015, 4019):
+        return code
+    if isinstance(code, str) and code in ("4015", "4019"):
+        return int(code)
+    return None
+
+
+def _terminal_provider_code(code):
+    if (type(code) is int and code == 4008) or code == "4008":
+        return ProviderQuota()
+    risk_code = _provider_risk_code(code)
+    return ProviderRisk(risk_code) if risk_code is not None else None
+
+
+def _terminal_provider_from_payload(payload):
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    error = payload.get("error")
+    if code in (None, "") and isinstance(error, dict):
+        code = error.get("code")
+    return _terminal_provider_code(code)
 
 
 # ---- 用量归一 -------------------------------------------------------------
@@ -7421,11 +7496,6 @@ def friendly_upstream_error(code, detail):
         return ("Trae 免费额度已用尽（4008 quota exceeded）：等待额度恢复或升级套餐；"
                 "这不是 4015 风控。上游详情：%s" % (detail[:240] or "(无详情)"),
                 "quota_exceeded")
-    if "risk_control" in detail:
-        return ("上游风控命中（Trae 4015/4019：账号或出口地区限制）。网关已冷却"
-                "该账号并换号；请使用与账号同区的出口、稍后重试或更换账号——"
-                "原地重试不会解决。上游详情：%s" % (detail[:240] or "(无详情)"),
-                "risk_control")
     if "trae 4023" in detail or "model_unknown" in detail:
         return ("上游不认识该模型（Trae 4023）。若 /v1/models 里该条 "
                 "available=false / catalog_only=true，表示目录里有、但当前账号的 "
@@ -7463,8 +7533,27 @@ def _to_int_status(status):
         return 502
 
 
+def _upstream_status_message(exc):
+    if isinstance(exc, TerminalProviderError):
+        return exc.detail, "risk_control" if isinstance(exc, ProviderRisk) else "quota_exceeded"
+    return friendly_upstream_error(_to_int_status(exc.status), exc.detail)
+
+
+def _note_provider_risk(account, exc, model):
+    if account is not None:
+        account.note_error("Trae %d: provider refusal" % exc.provider_code,
+                           code=exc.provider_code, model=model)
+        log("account %s received provider refusal %d; stopping this request"
+            % (account.uid[:8], exc.provider_code), level="WARN", tag="chat")
+
+
 def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
-    """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
+    """Apply account state for a non-200 SSE envelope."""
+    if isinstance(exc, ProviderRisk):
+        _note_provider_risk(account, exc, model)
+        return
+    if isinstance(exc, ProviderQuota):
+        return
     detail = getattr(exc, "detail", "") or ""
     if "4008" in detail or "exceeded the quota" in detail.lower():
         return
@@ -7503,8 +7592,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         dead = trae_accounts.session_dead(detail)
         # 10605 排队冷却为模型级或账号级
         is_queue = "10605" in detail or "isQueued" in detail
-        risk = "risk_control" in detail
-        cd = 300 if dead else (retry_secs if is_queue else (120 if risk else 60))
+        cd = 300 if dead else (retry_secs if is_queue else 60)
         if "trae 1001" in detail or " auth:" in detail:
             # 鉴权失败：先尝试刷新 token（换号之前最省的一步）
             try:
@@ -7520,11 +7608,6 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
                                     % (status_int, detail[:80]),
                                     code=status_int, cooldown=cd,
                                     model=model if is_queue else None)
-        if risk:
-            log("account %s hit upstream RISK CONTROL (HTTP %s): cooling %.0fs "
-                "and rotating - use a same-realm egress / another account, "
-                "do not retry in place" % (account.uid[:8], status_int, cd),
-                level="WARN", tag="chat")
         log("account %s rejected via envelope (HTTP %s, queue=%s), cooling for "
             "%.0fs (requested %ds, realm_ready=%d) and rotating"
             % (account.uid[:8], status_int, is_queue, float(actual or 0), cd,
@@ -7551,7 +7634,7 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
     层重试覆盖不到。只要 **尚未向客户端发出任何字节**、未超预算、且错误属
     瞬时类（418/5xx/provider_error，且非客户端参数错），就值得重开。
     """
-    if isinstance(exc, InvalidToolArguments):
+    if isinstance(exc, (TerminalProviderError, InvalidToolArguments)):
         return False
     if emitted_bytes:
         return False
@@ -7560,10 +7643,6 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
     # 401/403 (含 10605 排队被拒) 与 429 在未吐出字节前均允许通过 reopen 换号重试
-    # 风控（国际版 4015/4019）换号也没用、重开只会加速风控升级：
-    # 一次就够，交给客户端退避（PROTOCOL §11.4）。
-    if "risk_control" in detail:
-        return False
     if status_int in (401, 403, 429):
         return True
     return _is_transient_upstream(status_int, detail)
@@ -7575,8 +7654,7 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
 
     仅用于客户端尚未收到任何字节的非流式路径。返回 (chat_obj, account)：
       - 最终信封错误以 UpstreamStatus 抛出（调用方既有分支处理：记账+友好提示）
-      - 重开时 open_upstream 的 RateLimited/HTTPError 记日志后仍以**原信封**
-        错误上抛（原错误才是本次请求的真实结果，且其分支已具备友好映射）
+      - 重开遇到上游终止业务错误时保留该错误；其他重开失败沿用原错误。
       - 传输层瞬时错误（TLS EOF 等）同样触发重开
     传入的 resp 由调用方的 with/finally 关闭；本函数只负责关闭重开的新连接。
     """
@@ -7599,6 +7677,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 try:
                     new_resp, account, _ = open_upstream(
                         payload, session_key=session_key, target_realm=realm)
+                except TerminalProviderError:
+                    raise
                 except Exception as reopen_exc:
                     log("reopen after envelope error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -7621,6 +7701,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 try:
                     new_resp, account, _ = open_upstream(
                         payload, session_key=session_key, target_realm=realm)
+                except TerminalProviderError:
+                    raise
                 except Exception as reopen_exc:
                     log("reopen after transport error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -7702,7 +7784,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     账号轮换规则（PROTOCOL §六 / §11.4，code 语义由 trae_accounts.note_error 定义）：
       · 1001 / HTTP 401/403：先刷新 token 原地重试一次，仍失败 -> breaker 换号
       · 4001 / 4023        ：客户端参数 / 模型名问题 -> 立即失败，不换号不重试
-      · 4015 / 4019        ：账号/出口风控 -> 冷却换号，绝不原地轰炸
+      · 4015 / 4019        ：上游拒绝 -> 只冷却命中账号，终止当前请求
       · 429                ：模型粒度频控 -> 冷却换号
       · 5xx / 传输抖动     ：同账号快速重试（1s/2s），仍失败短冷却换号
     HTTP 200 + event:error 形态由 iter_inner_sse 抛 UpstreamStatus，交给
@@ -7786,6 +7868,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         host_i = 0
 
         while True:
+            terminal = None
             try:
                 if _trae_client is not None and hasattr(_trae_client, "open_chat"):
                     resp = trae_open_chat(account, realm, body_obj, timeout=600)
@@ -7799,9 +7882,19 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 break
             except urllib.error.HTTPError as exc:
                 try:
-                    detail = exc.read(600).decode("utf-8", "replace")
+                    # Legacy urllib transport: parse a bounded, complete JSON body
+                    # separately from the shorter diagnostic used for other errors.
+                    raw = exc.read(64 * 1024 + 1)
+                    detail = raw[:600].decode("utf-8", "replace")
+                    if len(raw) <= 64 * 1024:
+                        terminal = _terminal_provider_from_payload(_trae_json_or_none(raw))
                 except Exception:
                     detail = ""
+                finally:
+                    try:
+                        exc.close()
+                    except Exception:
+                        pass
                 try:
                     exc.qoder_detail = detail
                     exc.trae_detail = detail
@@ -7811,8 +7904,14 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 code = int(exc.code)
             except Exception as exc:
                 exc_obj = exc
+                if isinstance(exc, getattr(_trae_client, "UpstreamError", ())):
+                    terminal = _terminal_provider_code(exc.code)
                 code, detail = trae_exc_code_detail(exc)
 
+            if terminal is not None:
+                if isinstance(terminal, ProviderRisk):
+                    _note_provider_risk(account, terminal, model)
+                raise terminal
             if code in (401, 403) and not refreshed:
                 if trae_refresh_account(account, realm, force=True):
                     refreshed = True
@@ -7862,8 +7961,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         if code == 429:
             # 4008 是免费额度用尽，不是账号/出口故障：不要冷却账号、不要换号，
             # 直接把 429 交给客户端（额度恢复后可立即继续用）。
-            if "4008" in detail or "exceeded the quota" in detail.lower():
-                raise UpstreamStatus(429, detail or "quota exceeded")
+            if "exceeded the quota" in detail.lower():
+                raise ProviderQuota()
             account.note_error("HTTP 429 (model throttled)", code=429,
                                model=model, cooldown=60)
             log("account %s throttled on '%s' (429), cooling 60s"
@@ -8111,6 +8210,11 @@ def iter_inner_sse(resp, holder=None, allowed_names=None):
 
     for event, data in iter_trae_events(resp):
         obj = data if isinstance(data, dict) else {}
+        if event == "error" or (event == "message"
+                                and isinstance(obj.get("error"), dict)):
+            terminal = _terminal_provider_from_payload(obj)
+            if terminal is not None:
+                raise terminal
         if event == "metadata":
             session_id = str(obj.get("session_id") or "")
             if session_id:
@@ -9356,6 +9460,13 @@ class Handler(BaseHTTPRequestHandler):
         self._json(code, {"error": {"message": message, "type": err_type,
                                     "code": code}})
 
+    def _terminal_provider_error(self, exc, model, started):
+        record_error(model, exc.status, exc.detail,
+                     elapsed_ms=int((time.time() - started) * 1000))
+        msg, kind = _upstream_status_message(exc)
+        return self._json(exc.status, {"error": {"message": msg, "type": kind,
+                                                  "code": exc.provider_code}})
+
     def _quota_error(self, exc):
         """账号护栏拦截 -> HTTP 429（quota_exceeded，中文原因）。
 
@@ -9551,7 +9662,7 @@ class Handler(BaseHTTPRequestHandler):
             target = detect_model_realm(fallback) or realm
         return fallback, target, reason
 
-    def _model_precheck(self, model, realm):
+    def _model_precheck(self, model, realm, aliases=()):
         """模型级前置拒绝（统一落点，全部在 open_upstream 之前）。
 
         顺序：跨区错配[既有] -> 全局封禁[P1-4] -> Key 白名单[P1-4]。
@@ -9563,9 +9674,13 @@ class Handler(BaseHTTPRequestHandler):
         if quota_error:
             self._precheck_status = 429
             return quota_error
-        return (self._cross_realm_error(model, realm)
-                or self._banned_model_error(model)
-                or self._key_model_error(model))
+        # A model ban applies to equivalent names, but the Key allowlist
+        # continues to match only the client-supplied identifier.
+        for name in (model, *aliases):
+            blocked = self._cross_realm_error(name, realm) or self._banned_model_error(name)
+            if blocked:
+                return blocked
+        return self._key_model_error(model)
 
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
@@ -9815,8 +9930,15 @@ class Handler(BaseHTTPRequestHandler):
                 "messages": [{"role": "user", "content": "hi"}]},
                 target_realm=acc_realm(account))
             with response:
-                obj = aggregate_stream(response, model, None)
+                try:
+                    aggregate_stream(response, model, None)
+                except ProviderRisk as exc:
+                    _note_provider_risk(used, exc, model)
+                    raise
             return {"ok": True, "model": model, "elapsed_ms": int((time.time()-started)*1000)}
+        except TerminalProviderError as exc:
+            return {"ok": False, "model": model, "status": exc.status,
+                    "code": exc.provider_code, "error": exc.detail}
         except Exception as error:
             detail = str(error)
             return {"ok": False, "model": model, "error": detail[:300]}
@@ -10782,11 +10904,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_agent_solo(self, payload):
         model = str(payload.get("model") or "deepseek-v4.1-flash")
-        blocked = self._model_precheck(model, "cn")
+        agent_model = _solo_agent_only_key(model)
+        aliases = ()
+        if agent_model:
+            names = (agent_model, *trae_catalog.aliases_for(agent_model, "cn"))
+            aliases = tuple(name for name in dict.fromkeys(names) if name != model)
+        # Agent-only models are CN-only; respect an explicit or key-bound realm.
+        realm = self._request_realm() if agent_model else None
+        blocked = self._model_precheck(model, trae_realm(realm or "cn"), aliases=aliases)
         if blocked:
             return self._error(getattr(self, "_precheck_status", 400), blocked, "invalid_request_error")
         try:
             enforce_model_context(payload, model, "cn")
+            if agent_model and agent_model != model:
+                enforce_model_context(payload, agent_model, "cn")
         except UpstreamStatus as exc:
             return self._error(exc.status, exc.detail, "invalid_request_error")
         account = POOL.pick(realm="cn") if POOL else None
@@ -11200,7 +11331,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 resp, acc, _ = open_upstream(test_payload, target_realm=acc_realm(account))
                 with resp:
-                    chat_obj = aggregate_stream(resp, test_model, None)
+                    try:
+                        chat_obj = aggregate_stream(resp, test_model, None)
+                    except ProviderRisk as exc:
+                        _note_provider_risk(acc, exc, test_model)
+                        raise
                 wall_ms = int((time.time() - t0) * 1000)
                 choices = chat_obj.get("choices") or []
                 msg = (choices[0].get("message") or {}) if choices else {}
@@ -11215,6 +11350,11 @@ class Handler(BaseHTTPRequestHandler):
                                         "model": test_model,
                                         "elapsed_ms": wall_ms,
                                         "reply": reply_text})
+            except TerminalProviderError as exc:
+                return self._json(200, {"ok": False, "uid": account.uid,
+                                        "status": exc.status, "code": exc.provider_code,
+                                        "error": exc.detail,
+                                        "elapsed_ms": int((time.time() - t0) * 1000)})
             except RateLimited as exc:
                 wall_ms = int((time.time() - t0) * 1000)
                 return self._json(200, {"ok": False, "uid": account.uid,
@@ -11369,6 +11509,8 @@ class Handler(BaseHTTPRequestHandler):
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
             holder["account"] = account
+        except TerminalProviderError as exc:
+            return self._terminal_provider_error(exc, model, t_start)
         except QuotaBlocked as exc:
             record_error(model, 429, exc.message[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
@@ -11437,8 +11579,7 @@ class Handler(BaseHTTPRequestHandler):
                                                       session_key=session_key)
                     wall = int((time.time() - t_start) * 1000)
                     record_error(model, exc.status, exc.detail, elapsed_ms=wall)
-                    msg, _ = friendly_upstream_error(_to_int_status(exc.status),
-                                                     exc.detail)
+                    msg, _ = _upstream_status_message(exc)
                     log("anthropic upstream status %s: %s"
                         % (exc.status, msg[:200]), level="ERROR", tag="chat")
                     self._sse_write(trae_anthropic.anthropic_error_frame(msg))
@@ -11460,6 +11601,8 @@ class Handler(BaseHTTPRequestHandler):
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
                     holder, account)
+            except TerminalProviderError as exc:
+                return self._terminal_provider_error(exc, model, t_start)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000))
@@ -11520,6 +11663,8 @@ class Handler(BaseHTTPRequestHandler):
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
             holder["account"] = account
+        except TerminalProviderError as exc:
+            return self._terminal_provider_error(exc, model, t_start)
         except QuotaBlocked as exc:
             record_error(model, 429, exc.message[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
@@ -11617,6 +11762,9 @@ class Handler(BaseHTTPRequestHandler):
                                         chat_req, session_key=session_key,
                                         target_realm=req_realm,
                                         usage_ctx=usage_ctx)
+                                except TerminalProviderError as terminal:
+                                    pump_exc = terminal
+                                    break
                                 except Exception as rex:
                                     log("responses reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -11640,15 +11788,15 @@ class Handler(BaseHTTPRequestHandler):
                 if pump_exc is not None:
                     record_error(model, pump_exc.status, pump_exc.detail,
                                  elapsed_ms=int((time.time() - t_start) * 1000))
-                    msg, _ = friendly_upstream_error(
-                        _to_int_status(pump_exc.status), pump_exc.detail)
+                    msg, _ = _upstream_status_message(pump_exc)
                     log("responses upstream status %s: %s"
                         % (pump_exc.status, msg[:200]), level="ERROR",
                         tag="chat")
                     # Responses 协议靠终态事件收尾：只关流会让客户端一直等。
                     try:
-                        self._sse_write(_responses_failed_frame(
-                            holder, _to_int_status(pump_exc.status), msg))
+                        code = (pump_exc.provider_code if isinstance(pump_exc, TerminalProviderError)
+                                else _to_int_status(pump_exc.status))
+                        self._sse_write(_responses_failed_frame(holder, code, msg))
                     except Exception:
                         pass
                     self._sse_end()
@@ -11669,6 +11817,8 @@ class Handler(BaseHTTPRequestHandler):
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
                     holder, account)
+            except TerminalProviderError as exc:
+                return self._terminal_provider_error(exc, model, t_start)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000))
@@ -11910,12 +12060,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_anthropic(path, payload)
 
         # ---- Chat Completions 主链路 ----
-        # Qoder 优先判定：它的 id 带 `qoder/` 前缀，或裸名在 Qoder 目录里唯一命中。
+        # Qoder 优先判定：只接管显式带 `qoder/` 前缀的模型。
         # 放在 SOLO 判定之前，否则 `qoder/gmodel` 会被当成未知的 Trae 模型。
         _qoder_key = qoder_model_name(payload.get("model"))
         if _qoder_key is not None:
             return self._handle_qoder_chat(payload, _qoder_key)
-        if str(payload.get("model") or "") in SOLO_AGENT_MODELS:
+        model_name = str(payload.get("model") or "")
+        if model_name in SOLO_AGENT_MODELS or _solo_agent_only_key(model_name):
             return self._handle_agent_solo(payload)
         normalize_tool_choice(payload)
         normalize_tools(payload)
@@ -11954,6 +12105,8 @@ class Handler(BaseHTTPRequestHandler):
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
+        except TerminalProviderError as exc:
+            return self._terminal_provider_error(exc, model, t_start)
         except QuotaBlocked as exc:
             record_error(model, 429, exc.message[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
@@ -12041,6 +12194,9 @@ class Handler(BaseHTTPRequestHandler):
                                         payload, session_key=session_key,
                                         target_realm=req_realm,
                                         usage_ctx=usage_ctx)
+                                except TerminalProviderError as terminal:
+                                    pump_exc = terminal
+                                    break
                                 except Exception as rex:
                                     log("chat reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -12065,11 +12221,11 @@ class Handler(BaseHTTPRequestHandler):
                     exc = pump_exc
                     wall = int((time.time() - t_start) * 1000)
                     record_error(model, exc.status, exc.detail, elapsed_ms=wall)
-                    msg, etype = friendly_upstream_error(
-                        _to_int_status(exc.status), exc.detail)
+                    msg, etype = _upstream_status_message(exc)
+                    code = exc.provider_code if isinstance(exc, TerminalProviderError) else exc.status
                     err = json.dumps({"error": {
                         "message": msg, "type": etype,
-                        "code": exc.status}}, ensure_ascii=False)
+                        "code": code}}, ensure_ascii=False)
                     try:
                         self._sse_write(("data: %s\n\n" % err).encode("utf-8"))
                         self._sse_write(b"data: [DONE]\n\n")
@@ -12099,6 +12255,8 @@ class Handler(BaseHTTPRequestHandler):
                 result, account = aggregate_with_envelope_retry(
                     upstream, payload, session_key, req_realm, model,
                     holder, account)
+            except TerminalProviderError as exc:
+                return self._terminal_provider_error(exc, model, t_start)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000))
